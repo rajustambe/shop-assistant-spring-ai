@@ -1,0 +1,8 @@
+target/
+*.log
+.git/
+.idea/
+*.iml
+/tmp/
+mcp_test.py
+test.ps1
