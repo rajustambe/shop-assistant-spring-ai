@@ -81,6 +81,12 @@
             <groupId>org.springframework.ai</groupId>
             <artifactId>spring-ai-ollama</artifactId>
         </dependency>
+        <!-- Slice 2 (PDF ingestion): read policy docs from a real PDF (PagePdfDocumentReader,
+             backed by Apache PDFBox) instead of a markdown file. One Document per PDF page. -->
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-pdf-document-reader</artifactId>
+        </dependency>
         <!-- Slice 5: expose our @Tool methods over the MCP protocol (SSE transport) -->
         <dependency>
             <groupId>org.springframework.ai</groupId>

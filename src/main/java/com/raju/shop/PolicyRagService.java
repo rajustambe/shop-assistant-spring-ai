@@ -3,7 +3,9 @@ package com.raju.shop;
 import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.ai.document.Document;
 import org.springframework.ai.embedding.EmbeddingModel;
+import org.springframework.ai.reader.pdf.PagePdfDocumentReader;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -12,7 +14,6 @@ import org.springframework.stereotype.Service;
 
 import javax.sql.DataSource;
 import java.net.URI;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -22,9 +23,11 @@ import java.util.stream.IntStream;
 //   - shop.neon.url blank  -> in-memory vector list (app always boots)
 //   - shop.neon.url set    -> pgvector on Neon Postgres (persists across restarts)
 //
-// UPGRADE: instead of 6 hardcoded strings, we now LOAD a real document (shop-policies.md)
+// UPGRADE: instead of 6 hardcoded strings, we now PARSE a real PDF (shop-policies.pdf)
 // and CHUNK it into retrievable pieces. This mirrors a production ingestion pipeline:
-//   load file -> chunk -> embed each chunk -> store.
+//   parse PDF -> chunk -> embed each chunk -> store.
+// The PDF is authored one policy section per page, so page-based chunking (one
+// Document per page from PagePdfDocumentReader) yields one clean chunk per section.
 @Service
 public class PolicyRagService {
 
@@ -46,41 +49,33 @@ public class PolicyRagService {
     }
 
     // ----------------------------------------------------------------------------------
-    // INGESTION PIPELINE: load the document, then chunk it.
+    // INGESTION PIPELINE: parse the PDF (one page per section), then collect chunks.
     // ----------------------------------------------------------------------------------
 
-    /** Read the whole policy document from the classpath. */
-    private String loadPolicyDocument() {
-        try {
-            byte[] bytes = new ClassPathResource("shop-policies.md").getInputStream().readAllBytes();
-            return new String(bytes, StandardCharsets.UTF_8);
-        } catch (Exception e) {
-            throw new IllegalStateException("Could not load shop-policies.md", e);
-        }
-    }
-
     /**
-     * Structure-aware chunking: split the markdown on "## " section headings so each policy
-     * section (Returns, Shipping, Warranty, ...) becomes ONE self-contained chunk, heading included.
-     * Keeping a heading with its text gives the embedding clear context -> better retrieval.
+     * Parse shop-policies.pdf with Spring AI's PagePdfDocumentReader, which returns ONE
+     * Document per PDF page. The PDF is authored one policy section per page, so each page's
+     * text is already a self-contained chunk (Returns, Shipping, Warranty, ...).
+     * Whitespace is normalised so the embedding sees clean text.
      */
-    private List<String> chunkBySection(String document) {
+    private List<String> parseAndChunkPdf() {
+        PagePdfDocumentReader reader = new PagePdfDocumentReader(new ClassPathResource("shop-policies.pdf"));
         List<String> chunks = new ArrayList<>();
-        // split before every "## " heading (keep the heading with its body)
-        for (String part : document.split("(?m)(?=^## )")) {
-            String chunk = part.trim();
-            if (!chunk.isBlank() && chunk.startsWith("## ")) {
-                chunks.add(chunk.replaceAll("\\s+", " "));  // normalise whitespace
-            }
+        for (Document page : reader.get()) {
+            String chunk = page.getText().replaceAll("\\s+", " ").trim();
+            if (!chunk.isBlank()) chunks.add(chunk);
+        }
+        if (chunks.isEmpty()) {
+            throw new IllegalStateException("shop-policies.pdf produced no chunks");
         }
         return chunks;
     }
 
     @PostConstruct
     void index() {
-        // 1. LOAD + 2. CHUNK
-        this.docs = chunkBySection(loadPolicyDocument());
-        log.info("RAG ingestion: loaded shop-policies.md -> {} chunks", docs.size());
+        // 1. PARSE PDF + 2. CHUNK (one page == one section == one chunk)
+        this.docs = parseAndChunkPdf();
+        log.info("RAG ingestion: parsed shop-policies.pdf -> {} chunks", docs.size());
         docs.forEach(c -> log.info("   chunk: {}", c.length() > 60 ? c.substring(0, 60) + "..." : c));
 
         // 3. EMBED + 4. STORE
