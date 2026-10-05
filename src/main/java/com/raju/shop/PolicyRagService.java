@@ -15,6 +15,7 @@ import org.springframework.stereotype.Service;
 import javax.sql.DataSource;
 import java.net.URI;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 import java.util.stream.IntStream;
@@ -23,15 +24,19 @@ import java.util.stream.IntStream;
 //   - shop.neon.url blank  -> in-memory vector list (app always boots)
 //   - shop.neon.url set    -> pgvector on Neon Postgres (persists across restarts)
 //
-// UPGRADE: instead of 6 hardcoded strings, we now PARSE a real PDF (shop-policies.pdf)
-// and CHUNK it into retrievable pieces. This mirrors a production ingestion pipeline:
-//   parse PDF -> chunk -> embed each chunk -> store.
-// The PDF is authored one policy section per page, so page-based chunking (one
-// Document per page from PagePdfDocumentReader) yields one clean chunk per section.
+// PRODUCTION-SHAPED INGESTION:
+//   parse PDF -> SMART CHUNK (overlapping windows) + METADATA (section, page) -> embed -> store.
+// Unlike naive "one chunk per page", we split each page into overlapping word-windows so a long
+// section becomes several focused, retrievable chunks, and we keep each chunk's source section
+// heading + page number so answers can be CITED (e.g. "Returns and Exchanges, p.1").
 @Service
 public class PolicyRagService {
 
     private static final Logger log = LoggerFactory.getLogger(PolicyRagService.class);
+
+    // Chunking knobs (words). Small overlap keeps a fact from being split across a boundary.
+    private static final int CHUNK_WORDS = 60;
+    private static final int OVERLAP_WORDS = 15;
 
     private final EmbeddingModel embeddingModel;
     private final String neonUrl;               // blank => in-memory mode
@@ -39,8 +44,14 @@ public class PolicyRagService {
     private JdbcTemplate jdbc;                    // set only in pgvector mode
     private final List<float[]> memVectors = new ArrayList<>();  // used only in in-memory mode
 
-    // Populated at startup by loadAndChunk() — no longer hardcoded.
-    private List<String> docs = new ArrayList<>();
+    // Populated at startup by parseAndChunkPdf() — chunk text PLUS its source metadata.
+    private List<PolicyChunk> chunks = new ArrayList<>();
+
+    /** A retrievable piece of a policy doc, with enough metadata to cite its source. */
+    public record PolicyChunk(String content, String section, int page) {}
+
+    /** A chunk paired with a relevance score (cosine, or a reranked score). */
+    public record Scored(PolicyChunk chunk, double score) {}
 
     public PolicyRagService(EmbeddingModel embeddingModel,
                             @Value("${shop.neon.url:}") String neonUrl) {
@@ -49,40 +60,78 @@ public class PolicyRagService {
     }
 
     // ----------------------------------------------------------------------------------
-    // INGESTION PIPELINE: parse the PDF (one page per section), then collect chunks.
+    // INGESTION PIPELINE: parse the PDF, then smart-chunk each page with metadata.
     // ----------------------------------------------------------------------------------
 
     /**
-     * Parse shop-policies.pdf with Spring AI's PagePdfDocumentReader, which returns ONE
-     * Document per PDF page. The PDF is authored one policy section per page, so each page's
-     * text is already a self-contained chunk (Returns, Shipping, Warranty, ...).
-     * Whitespace is normalised so the embedding sees clean text.
+     * Parse shop-policies.pdf with Spring AI's PagePdfDocumentReader (one Document per page),
+     * then split each page into OVERLAPPING word-windows. The page's first non-blank line is its
+     * section heading; the page index is its page number. Both ride along on every chunk.
      */
-    private List<String> parseAndChunkPdf() {
+    private List<PolicyChunk> parseAndChunkPdf() {
         PagePdfDocumentReader reader = new PagePdfDocumentReader(new ClassPathResource("shop-policies.pdf"));
-        List<String> chunks = new ArrayList<>();
-        for (Document page : reader.get()) {
-            String chunk = page.getText().replaceAll("\\s+", " ").trim();
-            if (!chunk.isBlank()) chunks.add(chunk);
+        List<PolicyChunk> out = new ArrayList<>();
+        int page = 0;
+        for (Document doc : reader.get()) {
+            page++;
+            String raw = doc.getText();
+            if (raw == null || raw.isBlank()) continue;
+            String section = firstNonBlankLine(raw);
+            String body = raw.replaceAll("\\s+", " ").trim();   // normalise for embedding
+            for (String window : splitWithOverlap(body, CHUNK_WORDS, OVERLAP_WORDS)) {
+                out.add(new PolicyChunk(window, section, page));
+            }
         }
-        if (chunks.isEmpty()) {
+        if (out.isEmpty()) {
             throw new IllegalStateException("shop-policies.pdf produced no chunks");
         }
-        return chunks;
+        return out;
+    }
+
+    /** First non-blank line of the raw page text = the section heading (whitespace collapsed:
+     *  PDFBox often extracts bold headings with wide inter-letter spacing). */
+    private static String firstNonBlankLine(String raw) {
+        for (String line : raw.split("\\r?\\n")) {
+            String t = line.replaceAll("\\s+", " ").trim();
+            if (!t.isBlank()) return t;
+        }
+        return "Policy";
+    }
+
+    /**
+     * Sliding-window chunker: cut the text into windows of {@code size} words that overlap by
+     * {@code overlap} words, so a fact near a boundary still appears whole in one window.
+     */
+    private static List<String> splitWithOverlap(String text, int size, int overlap) {
+        String[] words = text.split("\\s+");
+        List<String> parts = new ArrayList<>();
+        if (words.length <= size) {
+            parts.add(text);
+            return parts;
+        }
+        int step = size - overlap;                   // how far the window advances each time
+        for (int start = 0; start < words.length; start += step) {
+            int end = Math.min(start + size, words.length);
+            parts.add(String.join(" ", Arrays.copyOfRange(words, start, end)));
+            if (end == words.length) break;
+        }
+        return parts;
     }
 
     @PostConstruct
     void index() {
-        // 1. PARSE PDF + 2. CHUNK (one page == one section == one chunk)
-        this.docs = parseAndChunkPdf();
-        log.info("RAG ingestion: parsed shop-policies.pdf -> {} chunks", docs.size());
-        docs.forEach(c -> log.info("   chunk: {}", c.length() > 60 ? c.substring(0, 60) + "..." : c));
+        // 1. PARSE PDF + 2. SMART CHUNK (+metadata)
+        this.chunks = parseAndChunkPdf();
+        log.info("RAG ingestion: parsed shop-policies.pdf -> {} chunks (size={}, overlap={} words)",
+                chunks.size(), CHUNK_WORDS, OVERLAP_WORDS);
+        chunks.forEach(c -> log.info("   chunk [{} p.{}]: {}", c.section(), c.page(),
+                c.content().length() > 50 ? c.content().substring(0, 50) + "..." : c.content()));
 
         // 3. EMBED + 4. STORE
         if (neonUrl.isBlank()) {
             log.info("RAG: shop.neon.url not set -> using IN-MEMORY vector store.");
-            for (String d : docs) memVectors.add(embeddingModel.embed(d));
-            log.info("RAG: embedded {} chunks ({}-dim vectors).", docs.size(),
+            for (PolicyChunk c : chunks) memVectors.add(embeddingModel.embed(c.content()));
+            log.info("RAG: embedded {} chunks ({}-dim vectors).", chunks.size(),
                     memVectors.isEmpty() ? 0 : memVectors.get(0).length);
             return;
         }
@@ -90,51 +139,55 @@ public class PolicyRagService {
         log.info("RAG: using PGVECTOR on Neon.");
         this.jdbc = new JdbcTemplate(neonDataSource(neonUrl));
         jdbc.execute("CREATE EXTENSION IF NOT EXISTS vector");
-        // 768 dims to match nomic-embed-text (was 384 for all-MiniLM).
+        // 768 dims to match nomic-embed-text. section/page columns carry the citation metadata.
         jdbc.execute("""
             CREATE TABLE IF NOT EXISTS policy_docs (
                 id        serial PRIMARY KEY,
                 content   text NOT NULL,
+                section   text,
+                page      int,
                 embedding vector(768)
             )
             """);
-        jdbc.update("TRUNCATE policy_docs");   // re-embed fresh (model/dims changed)
-        log.info("pgvector: embedding and inserting {} chunks into Neon...", docs.size());
-        for (String d : docs) {
-            jdbc.update("INSERT INTO policy_docs (content, embedding) VALUES (?, ?::vector)",
-                    d, toVectorLiteral(embeddingModel.embed(d)));
+        jdbc.update("TRUNCATE policy_docs");   // re-embed fresh (schema/chunking changed)
+        log.info("pgvector: embedding and inserting {} chunks into Neon...", chunks.size());
+        for (PolicyChunk c : chunks) {
+            jdbc.update("INSERT INTO policy_docs (content, section, page, embedding) VALUES (?, ?, ?, ?::vector)",
+                    c.content(), c.section(), c.page(), toVectorLiteral(embeddingModel.embed(c.content())));
         }
         log.info("pgvector: done.");
     }
 
-    private record Scored(String content, double score) {}
-
-    /** Retrieve up to k policy snippets ranked by cosine similarity, above the threshold. */
-    public List<String> retrieve(String query, int k, double threshold) {
+    /**
+     * Retrieve up to k chunks ranked by cosine similarity, above the threshold.
+     * This is the DENSE (semantic) stage; a reranker can re-score the candidates afterwards.
+     */
+    public List<Scored> retrieve(String query, int k, double threshold) {
         float[] q = embeddingModel.embed(query);
         return (jdbc == null) ? retrieveInMemory(q, k, threshold)
                               : retrievePgvector(q, k, threshold);
     }
 
-    private List<String> retrieveInMemory(float[] q, int k, double threshold) {
-        return IntStream.range(0, docs.size())
-                .mapToObj(i -> new Scored(docs.get(i), cosine(q, memVectors.get(i))))
+    private List<Scored> retrieveInMemory(float[] q, int k, double threshold) {
+        return IntStream.range(0, chunks.size())
+                .mapToObj(i -> new Scored(chunks.get(i), cosine(q, memVectors.get(i))))
                 .filter(s -> s.score() >= threshold)
                 .sorted(Comparator.comparingDouble(Scored::score).reversed())
                 .limit(k)
-                .map(Scored::content)
                 .toList();
     }
 
-    private List<String> retrievePgvector(float[] q, int k, double threshold) {
+    private List<Scored> retrievePgvector(float[] q, int k, double threshold) {
         String qv = toVectorLiteral(q);
         // <=> is pgvector cosine DISTANCE; similarity = 1 - distance. Postgres does the ranking.
         List<Scored> rows = jdbc.query(
-                "SELECT content, 1 - (embedding <=> ?::vector) AS score " +
+                "SELECT content, section, page, 1 - (embedding <=> ?::vector) AS score " +
                 "FROM policy_docs ORDER BY embedding <=> ?::vector LIMIT ?",
-                (rs, i) -> new Scored(rs.getString("content"), rs.getDouble("score")),
+                (rs, i) -> new Scored(
+                        new PolicyChunk(rs.getString("content"), rs.getString("section"), rs.getInt("page")),
+                        rs.getDouble("score")),
                 qv, qv, k);
-        return rows.stream().filter(s -> s.score() >= threshold).map(Scored::content).toList();
+        return rows.stream().filter(s -> s.score() >= threshold).toList();
     }
 
     /** Build a JDBC DataSource from a postgresql://user:pass@host/db?... URL. */
